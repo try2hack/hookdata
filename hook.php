@@ -1,7 +1,7 @@
 <?php
 $servername = "localhost";
 $username = "test_master";
-$password = "!kwr0i*%%qzelgkD";
+$password = "Passw0rd";
 $dbname = "test_hook";
 
 $conn = new mysqli($servername, $username, $password, $dbname);
@@ -15,7 +15,7 @@ function decryptData($encodedData) {
         return null;
     }
     
-    $url = 'https://krmmkqbuy4.execute-api.ap-southeast-1.amazonaws.com/prod/secure/decrypted/' . $encodedData;
+    $url = 'https://xxx.com/prod/secure/decrypted/' . $encodedData;
     $response = @file_get_contents($url);
 
     if ($response === FALSE) {
