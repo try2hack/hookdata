@@ -6,7 +6,7 @@ function decryptData($encodedData) {
         return null;
     }
 
-    $url = 'https://aantmod.io/decrypted/' . $encodedData;
+    $url = 'https://xxx/decrypted/' . $encodedData;
     $response = @file_get_contents($url);
 
     if ($response === FALSE) {
@@ -29,8 +29,16 @@ if ($data) {
         $accountNumber = decryptData($data['accountNumber']);
 
         if ($username && $tel && $accountNumber) {
-            // Check for duplicate
-            $checkQuery = "SELECT COUNT(*) as count FROM register WHERE username = ? AND tel = ? AND accountNumber = ?";
+            // Check for duplicate in the last 10 records
+            $checkQuery = "
+                SELECT COUNT(*) as count 
+                FROM (
+                    SELECT username, tel, accountNumber 
+                    FROM register 
+                    ORDER BY createDate DESC 
+                    LIMIT 10
+                ) AS subquery 
+                WHERE username = ? AND tel = ? AND accountNumber = ?";
             $stmt = $conn->prepare($checkQuery);
             $stmt->bind_param("sss", $username, $tel, $accountNumber);
             $stmt->execute();
@@ -55,10 +63,18 @@ if ($data) {
         $username = decryptData($data['username']);
 
         if ($username) {
-            // Check for duplicate
-            $checkQuery = "SELECT COUNT(*) as count FROM deposit WHERE username = ? AND bankNo = ? AND dateBank = ?";
+            // Check for duplicate in the last 10 records
+            $checkQuery = "
+                SELECT COUNT(*) as count 
+                FROM (
+                    SELECT username, bankName, createDate, updateDate 
+                    FROM deposit 
+                    ORDER BY createDate DESC 
+                    LIMIT 10
+                ) AS subquery 
+                WHERE username = ? AND bankName = ? AND createDate = ? AND updateDate = ?";
             $stmt = $conn->prepare($checkQuery);
-            $stmt->bind_param("sss", $username, $data['bankNo'], $data['dateBank']);
+            $stmt->bind_param("ssss", $username, $data['bankName'], $data['createDate'], $data['updateDate']);
             $stmt->execute();
             $result = $stmt->get_result();
             $row = $result->fetch_assoc();
@@ -83,10 +99,18 @@ if ($data) {
         $tel = decryptData($data['tel']);
 
         if ($username && $accountNumber && $tel) {
-            // Check for duplicate
-            $checkQuery = "SELECT COUNT(*) as count FROM withdraw WHERE username = ? AND accountNumber = ? AND createDate = ?";
+            // Check for duplicate in the last 10 records
+            $checkQuery = "
+                SELECT COUNT(*) as count 
+                FROM (
+                    SELECT username, accountNumber, createDate, updateDate 
+                    FROM withdraw 
+                    ORDER BY createDate DESC 
+                    LIMIT 10
+                ) AS subquery 
+                WHERE username = ? AND accountNumber = ? AND createDate = ? AND updateDate = ?";
             $stmt = $conn->prepare($checkQuery);
-            $stmt->bind_param("sss", $username, $accountNumber, $data['createDate']);
+            $stmt->bind_param("ssss", $username, $accountNumber, $data['createDate'], $data['updateDate']);
             $stmt->execute();
             $result = $stmt->get_result();
             $row = $result->fetch_assoc();
