@@ -1,0 +1,10 @@
+# Local configuration & secrets (never commit real credentials)
+config.php
+.env
+*.local.php
+
+# Logs / editor noise
+*.log
+.DS_Store
+.idea/
+.vscode/
