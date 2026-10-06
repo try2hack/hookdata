@@ -1,130 +1,135 @@
 <?php
 /**
- * hookdata — admin dashboard (admin-only).
+ * hookdata — Monthly Deposit Leaderboard (admin-only).
  *
- * Modern Bootstrap 5 UI: summary cards, tabs per event type, search/date
- * filters, sticky-header tables, masking of sensitive fields, pagination,
- * and a dark/light theme toggle. No build step (CDN assets only).
+ * Ranks users by total deposits (SUM of deposit.value) within a selected
+ * month (Asia/Bangkok). Phone number is resolved from the register table by
+ * username (deposit has no tel column). Shows rank, phone, total deposit and
+ * a small deposit count; top 3 are highlighted. Includes a CSV export.
  *
  * Security preserved: HTTP Basic auth, prepared statements, htmlspecialchars.
+ * Date filtering uses an index-friendly half-open range
+ * (createDate >= first-day AND createDate < first-day-of-next-month).
  */
 
 declare(strict_types=1);
 
 require_once __DIR__ . '/lib.php';
 
-// Authenticate BEFORE touching the database or rendering anything.
+// Authenticate BEFORE touching the database or emitting anything.
 hd_require_viewer_auth();
 
 require_once __DIR__ . '/dbconnect.php';
 
-const HD_ALLOWED_TABLES = ['register', 'deposit', 'withdraw'];
-const HD_PER_PAGE = 25;
+date_default_timezone_set('Asia/Bangkok');
 
-// Columns whose values are masked by default (show last 4 chars only).
-const HD_SENSITIVE   = ['tel', 'accountNumber', 'bankNo'];
-// Columns formatted as numbers.
-const HD_NUMERIC_COLS = ['value', 'bonus', 'beforeValue', 'afterValue', 'topUp'];
-// Columns formatted as date/time.
-const HD_DATE_COLS    = ['createDate', 'updateDate', 'dateBank'];
-// Columns rendered as badges.
-const HD_BADGE_COLS   = ['bankName', 'type', 'actionName', 'prefix'];
+const HD_ALLOWED_PER = [10, 25, 50, 100];
 
 // ---- Request --------------------------------------------------------------
-$type = $_GET['type'] ?? 'register';
-if (!in_array($type, HD_ALLOWED_TABLES, true)) {
-    $type = 'register';
+$month = (string) ($_GET['month'] ?? date('Y-m'));
+if (!preg_match('/^\d{4}-\d{2}$/', $month)) {
+    $month = date('Y-m');
 }
-$username = trim((string) ($_GET['username'] ?? ''));
-$date     = trim((string) ($_GET['date'] ?? ''));          // YYYY-MM-DD
-$reveal   = isset($_GET['reveal']) && $_GET['reveal'] === '1';
-$theme    = (($_GET['theme'] ?? '') === 'dark') ? 'dark' : 'light'; // initial theme (JS/localStorage can override)
-$page     = max(1, (int) ($_GET['page'] ?? 1));
-$offset   = ($page - 1) * HD_PER_PAGE;
+$reveal = isset($_GET['reveal']) && $_GET['reveal'] === '1';
+$theme  = (($_GET['theme'] ?? '') === 'dark') ? 'dark' : 'light';
+$export = ($_GET['export'] ?? '') === 'csv';
+$per    = (int) ($_GET['per'] ?? 25);
+if (!in_array($per, HD_ALLOWED_PER, true)) {
+    $per = 25;
+}
+$page   = max(1, (int) ($_GET['page'] ?? 1));
 
-// Only accept a valid ISO date; ignore anything else.
-if ($date !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
-    $date = '';
-}
+// Half-open month range (index-friendly; works lexicographically on ISO strings).
+$start = $month . '-01 00:00:00';
+$next  = date('Y-m-d H:i:s', strtotime($month . '-01 00:00:00 +1 month'));
 
 /**
- * Build WHERE clause + bound params from the active filters.
- * Returns [sqlWhere, typesString, paramsArray].
+ * Return a prepared statement for the month's deposit ranking.
+ * tel is taken from the user's most recent register row (by id).
+ * $limit < 0 means "no limit" (used for CSV export).
  */
-function hd_build_filters(string $username, string $date): array
+function hd_leaderboard_stmt(mysqli $conn, string $start, string $next, int $limit, int $offset): mysqli_stmt
 {
-    $where  = [];
-    $types  = '';
-    $params = [];
-    if ($username !== '') {
-        $where[]  = 'username = ?';
-        $types   .= 's';
-        $params[] = $username;
+    $sql = "SELECT d.username,
+                   SUM(d.value)   AS total_deposit,
+                   COUNT(*)       AS deposit_count,
+                   r.tel          AS tel
+            FROM deposit d
+            LEFT JOIN register r
+                   ON r.username = d.username
+                  AND r.id = (SELECT MAX(r2.id) FROM register r2 WHERE r2.username = d.username)
+            WHERE d.createDate >= ? AND d.createDate < ?
+            GROUP BY d.username, r.tel
+            ORDER BY total_deposit DESC, d.username ASC";
+
+    if ($limit >= 0) {
+        $sql .= ' LIMIT ? OFFSET ?';
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param('ssii', $start, $next, $limit, $offset);
+    } else {
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param('ss', $start, $next);
     }
-    if ($date !== '') {
-        $where[]  = 'createDate LIKE ?';
-        $types   .= 's';
-        $params[] = $date . '%';
-    }
-    $sql = $where ? (' WHERE ' . implode(' AND ', $where)) : '';
-    return [$sql, $types, $params];
+    $stmt->execute();
+    return $stmt;
 }
 
-/** Bind a dynamic params array to a statement (by reference). */
-function hd_bind(mysqli_stmt $stmt, string $types, array $params): void
+/** Month-level summary: distinct depositing users + total deposit value. */
+function hd_month_summary(mysqli $conn, string $start, string $next): array
 {
-    if ($types === '') {
-        return;
-    }
-    $refs = [];
-    foreach ($params as $k => $v) {
-        $refs[$k] = &$params[$k];
-    }
-    $stmt->bind_param($types, ...$refs);
+    $stmt = $conn->prepare(
+        'SELECT COUNT(DISTINCT username) AS users, COALESCE(SUM(value),0) AS total
+         FROM deposit WHERE createDate >= ? AND createDate < ?'
+    );
+    $stmt->bind_param('ss', $start, $next);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    return ['users' => (int) ($row['users'] ?? 0), 'total' => (int) ($row['total'] ?? 0)];
 }
 
-/** Fetch a page of rows + total count for one whitelisted table. */
-function hd_fetch_page(mysqli $conn, string $table, string $username, string $date, int $limit, int $offset): array
-{
-    if (!in_array($table, HD_ALLOWED_TABLES, true)) {
-        return [[], 0];
+// ---- CSV export (must run before any HTML) --------------------------------
+if ($export) {
+    try {
+        $stmt = hd_leaderboard_stmt($conn, $start, $next, -1, 0);
+        $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    } catch (mysqli_sql_exception $e) {
+        error_log('hookdata leaderboard export error: ' . $e->getMessage());
+        http_response_code(500);
+        echo 'Internal server error';
+        exit;
+    } finally {
+        $conn->close();
     }
-    [$where, $types, $params] = hd_build_filters($username, $date);
 
-    // Count
-    $cStmt = $conn->prepare("SELECT COUNT(*) AS c FROM {$table}{$where}");
-    hd_bind($cStmt, $types, $params);
-    $cStmt->execute();
-    $total = (int) ($cStmt->get_result()->fetch_assoc()['c'] ?? 0);
-
-    // Page
-    $pStmt = $conn->prepare("SELECT * FROM {$table}{$where} ORDER BY id DESC LIMIT ? OFFSET ?");
-    hd_bind($pStmt, $types . 'ii', array_merge($params, [$limit, $offset]));
-    $pStmt->execute();
-    $rows = $pStmt->get_result()->fetch_all(MYSQLI_ASSOC);
-
-    return [$rows, $total];
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="deposit-leaderboard-' . $month . '.csv"');
+    $out = fopen('php://output', 'w');
+    fwrite($out, "\xEF\xBB\xBF"); // UTF-8 BOM so Excel reads Thai correctly
+    fputcsv($out, ['rank', 'tel', 'total_deposit', 'deposit_count']);
+    $rank = 0;
+    foreach ($rows as $r) {
+        $rank++;
+        // Full (unmasked) tel in the export — it is behind auth.
+        fputcsv($out, [$rank, (string) ($r['tel'] ?? ''), (int) $r['total_deposit'], (int) $r['deposit_count']]);
+    }
+    fclose($out);
+    exit;
 }
 
-/** Overall summary stats for the cards (global, independent of filters). */
-function hd_stats(mysqli $conn): array
-{
-    $one = fn(string $sql) => (int) ($conn->query($sql)->fetch_assoc()['v'] ?? 0);
-    return [
-        'register_count' => $one('SELECT COUNT(*) AS v FROM register'),
-        'deposit_count'  => $one('SELECT COUNT(*) AS v FROM deposit'),
-        'deposit_sum'    => $one('SELECT COALESCE(SUM(value),0) AS v FROM deposit'),
-        'deposit_bonus'  => $one('SELECT COALESCE(SUM(bonus),0) AS v FROM deposit'),
-        'withdraw_count' => $one('SELECT COUNT(*) AS v FROM withdraw'),
-        'withdraw_sum'   => $one('SELECT COALESCE(SUM(value),0) AS v FROM withdraw'),
-    ];
-}
-
+// ---- Normal page ----------------------------------------------------------
 try {
-    $stats = hd_stats($conn);
-    [$rows, $total] = hd_fetch_page($conn, $type, $username, $date, HD_PER_PAGE, $offset);
+    $summary = hd_month_summary($conn, $start, $next);
+    $total   = $summary['users'];
+    $totalPages = max(1, (int) ceil($total / $per));
+    if ($page > $totalPages) {
+        $page = $totalPages;
+    }
+    $offset = ($page - 1) * $per;
+
+    $stmt = hd_leaderboard_stmt($conn, $start, $next, $per, $offset);
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 } catch (mysqli_sql_exception $e) {
-    error_log('hookdata view error: ' . $e->getMessage());
+    error_log('hookdata leaderboard error: ' . $e->getMessage());
     http_response_code(500);
     echo 'Internal server error';
     exit;
@@ -132,18 +137,11 @@ try {
     $conn->close();
 }
 
-$totalPages = max(1, (int) ceil($total / HD_PER_PAGE));
-if ($page > $totalPages) {
-    $page = $totalPages;
-}
-
 // ---- Presentation helpers -------------------------------------------------
 
-/** Mask a value, keeping only the last 4 characters visible. */
+/** Mask a value keeping only the last 4 chars (ASCII phone => byte-safe). */
 function hd_mask(string $v): string
 {
-    // Sensitive fields are ASCII (phone / account numbers); byte-safe is fine
-    // and avoids a hard dependency on the mbstring extension.
     $len = strlen($v);
     if ($len <= 4) {
         return str_repeat('•', max($len, 1));
@@ -151,32 +149,11 @@ function hd_mask(string $v): string
     return str_repeat('•', min($len - 4, 6)) . substr($v, -4);
 }
 
-/** Format a single cell for display (always escapes). */
-function hd_cell(string $col, $val, bool $reveal): string
-{
-    $s = (string) $val;
-
-    if (in_array($col, HD_SENSITIVE, true) && !$reveal && $s !== '') {
-        return '<span class="text-nowrap font-monospace" title="masked">'
-            . htmlspecialchars(hd_mask($s)) . '</span>';
-    }
-    if (in_array($col, HD_NUMERIC_COLS, true) && is_numeric($s)) {
-        return '<span class="num">' . htmlspecialchars(number_format((float) $s)) . '</span>';
-    }
-    if (in_array($col, HD_BADGE_COLS, true) && $s !== '') {
-        return '<span class="badge rounded-pill badge-soft">' . htmlspecialchars($s) . '</span>';
-    }
-    if (in_array($col, HD_DATE_COLS, true) && $s !== '') {
-        return '<span class="text-nowrap text-body-secondary small">' . htmlspecialchars($s) . '</span>';
-    }
-    return htmlspecialchars($s);
-}
-
 /** Preserve current query params while overriding some. */
 function hd_url(array $overrides): string
 {
-    $base = ['type' => $_GET['type'] ?? 'register'];
-    foreach (['username', 'date', 'reveal', 'page'] as $k) {
+    $base = [];
+    foreach (['month', 'reveal', 'per', 'page'] as $k) {
         if (isset($_GET[$k]) && $_GET[$k] !== '') {
             $base[$k] = $_GET[$k];
         }
@@ -187,13 +164,24 @@ function hd_url(array $overrides): string
 }
 
 function hd_nf(int $n): string { return number_format($n); }
+
+/** Human month label, e.g. "ตุลาคม 2026". */
+function hd_month_label(string $month): string
+{
+    $months = [1=>'มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน',
+               'กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
+    [$y, $m] = array_map('intval', explode('-', $month));
+    return ($months[$m] ?? $month) . ' ' . $y;
+}
+
+$avg = $total > 0 ? (int) round($summary['total'] / $total) : 0;
 ?>
 <!doctype html>
 <html lang="th" data-bs-theme="<?php echo $theme; ?>">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>hookdata · Dashboard</title>
+    <title>hookdata · Leaderboard ยอดฝาก</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -203,7 +191,6 @@ function hd_nf(int $n): string { return number_format($n); }
         :root { --hd-radius: 14px; }
         body {
             font-family: "Noto Sans Thai", "IBM Plex Sans Thai", system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-            background: var(--bs-body-bg);
         }
         [data-bs-theme="light"] body { background: #f4f6fb; }
         [data-bs-theme="dark"]  body { background: #0f1420; }
@@ -211,56 +198,46 @@ function hd_nf(int $n): string { return number_format($n); }
         .stat-card {
             border: 1px solid var(--bs-border-color-translucent);
             border-radius: var(--hd-radius);
-            overflow: hidden;
-            transition: transform .12s ease, box-shadow .12s ease;
         }
-        .stat-card:hover { transform: translateY(-2px); box-shadow: 0 .5rem 1.2rem rgba(0,0,0,.08); }
-        .stat-icon {
-            width: 46px; height: 46px; border-radius: 12px;
-            display: grid; place-items: center; font-size: 1.35rem;
-        }
+        .stat-icon { width: 46px; height: 46px; border-radius: 12px; display: grid; place-items: center; font-size: 1.35rem; }
         .stat-value { font-size: 1.6rem; font-weight: 700; line-height: 1.1; }
-        .stat-label { font-size: .8rem; letter-spacing: .4px; text-transform: uppercase; }
-        .card, .nav-tabs, .table { --bs-border-color: var(--bs-border-color-translucent); }
-        .panel {
-            border: 1px solid var(--bs-border-color-translucent);
-            border-radius: var(--hd-radius);
-            background: var(--bs-body-bg);
-        }
-        .table-wrap { max-height: 65vh; overflow: auto; border-radius: 0 0 var(--hd-radius) var(--hd-radius); }
+        .stat-label { font-size: .78rem; letter-spacing: .4px; text-transform: uppercase; }
+        .panel { border: 1px solid var(--bs-border-color-translucent); border-radius: var(--hd-radius); background: var(--bs-body-bg); }
+        .table-wrap { max-height: 62vh; overflow: auto; border-radius: 0 0 var(--hd-radius) var(--hd-radius); }
         .table thead th {
-            position: sticky; top: 0; z-index: 2;
-            background: var(--bs-tertiary-bg);
-            white-space: nowrap; font-size: .78rem;
-            text-transform: uppercase; letter-spacing: .3px;
+            position: sticky; top: 0; z-index: 2; background: var(--bs-tertiary-bg);
+            white-space: nowrap; font-size: .78rem; text-transform: uppercase; letter-spacing: .3px;
         }
-        .table td { vertical-align: middle; font-size: .9rem; }
+        .table td { vertical-align: middle; }
         .num { font-variant-numeric: tabular-nums; }
-        .badge-soft {
-            background: color-mix(in srgb, var(--bs-primary) 14%, transparent);
-            color: var(--bs-primary); font-weight: 500;
-        }
-        .nav-tabs .nav-link { border: 0; color: var(--bs-secondary-color); font-weight: 500; }
-        .nav-tabs .nav-link.active {
-            color: var(--bs-primary); background: transparent;
-            border-bottom: 3px solid var(--bs-primary);
-        }
+        .rank-badge { width: 34px; height: 34px; border-radius: 50%; display: inline-grid; place-items: center; font-weight: 700; }
+        .rank-1 { background: linear-gradient(135deg,#ffd700,#f0b000); color:#4d3b00; }
+        .rank-2 { background: linear-gradient(135deg,#d7dce3,#aeb6c2); color:#2b303a; }
+        .rank-3 { background: linear-gradient(135deg,#e0a06a,#c57b3e); color:#3a240f; }
+        tr.top-row td { background: color-mix(in srgb, var(--bs-warning) 8%, transparent); }
+        .amount { font-weight: 700; font-size: 1.02rem; }
         .empty-state { padding: 3.5rem 1rem; text-align: center; color: var(--bs-secondary-color); }
         .empty-state i { font-size: 2.6rem; opacity: .5; }
+        .tel { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     </style>
 </head>
 <body>
 <nav class="navbar navbar-expand bg-body shadow-sm sticky-top">
     <div class="container-fluid px-4">
         <span class="navbar-brand d-flex align-items-center gap-2">
-            <i class="bi bi-diagram-3-fill text-primary"></i> hookdata <span class="text-body-secondary fw-normal fs-6">dashboard</span>
+            <i class="bi bi-trophy-fill text-warning"></i> hookdata
+            <span class="text-body-secondary fw-normal fs-6">อันดับยอดฝากรายเดือน</span>
         </span>
         <div class="ms-auto d-flex align-items-center gap-2">
+            <a class="btn btn-sm btn-success"
+               href="<?php echo htmlspecialchars(hd_url(['export' => 'csv'])); ?>">
+                <i class="bi bi-filetype-csv"></i> <span class="d-none d-sm-inline">ดาวน์โหลด CSV</span>
+            </a>
             <a class="btn btn-sm btn-outline-secondary <?php echo $reveal ? 'active' : ''; ?>"
                href="<?php echo htmlspecialchars(hd_url(['reveal' => $reveal ? '0' : '1'])); ?>"
-               title="แสดง/ซ่อนข้อมูลเต็ม">
+               title="แสดง/ซ่อนเบอร์โทรเต็ม">
                 <i class="bi bi-<?php echo $reveal ? 'eye-slash' : 'eye'; ?>"></i>
-                <span class="d-none d-sm-inline"><?php echo $reveal ? 'ซ่อนข้อมูล' : 'แสดงเต็ม'; ?></span>
+                <span class="d-none d-sm-inline"><?php echo $reveal ? 'ซ่อนเบอร์' : 'แสดงเบอร์'; ?></span>
             </a>
             <button id="themeToggle" class="btn btn-sm btn-outline-secondary" title="สลับธีม">
                 <i class="bi bi-moon-stars"></i>
@@ -271,124 +248,110 @@ function hd_nf(int $n): string { return number_format($n); }
 
 <div class="container-fluid px-4 py-4">
 
+    <!-- Controls -->
+    <form method="GET" action="view.php" class="panel p-3 mb-4">
+        <?php if ($reveal): ?><input type="hidden" name="reveal" value="1"><?php endif; ?>
+        <div class="row g-2 align-items-end">
+            <div class="col-12 col-md-4">
+                <label class="form-label small text-body-secondary mb-1">เดือน / Month</label>
+                <input type="month" name="month" class="form-control" value="<?php echo htmlspecialchars($month); ?>">
+            </div>
+            <div class="col-6 col-md-3">
+                <label class="form-label small text-body-secondary mb-1">แสดงต่อหน้า / Top-N</label>
+                <select name="per" class="form-select">
+                    <?php foreach (HD_ALLOWED_PER as $opt): ?>
+                        <option value="<?php echo $opt; ?>" <?php echo $opt === $per ? 'selected' : ''; ?>><?php echo $opt; ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <div class="col-6 col-md-2 d-grid">
+                <button type="submit" class="btn btn-primary"><i class="bi bi-arrow-repeat"></i> ดูอันดับ</button>
+            </div>
+            <div class="col-12 col-md-3 text-md-end">
+                <span class="text-body-secondary small">เดือน</span>
+                <div class="fw-semibold"><?php echo htmlspecialchars(hd_month_label($month)); ?></div>
+            </div>
+        </div>
+    </form>
+
     <!-- Summary cards -->
     <div class="row g-3 mb-4">
-        <div class="col-12 col-md-6 col-xl-3">
+        <div class="col-12 col-md-4">
             <div class="stat-card bg-body p-3 h-100">
                 <div class="d-flex align-items-center gap-3">
-                    <div class="stat-icon text-bg-primary bg-opacity-10 text-primary"><i class="bi bi-person-plus-fill"></i></div>
+                    <div class="stat-icon bg-success bg-opacity-10 text-success"><i class="bi bi-cash-stack"></i></div>
                     <div>
-                        <div class="stat-label text-body-secondary">สมัคร / Register</div>
-                        <div class="stat-value"><?php echo hd_nf($stats['register_count']); ?></div>
+                        <div class="stat-label text-body-secondary">ยอดฝากรวมทั้งเดือน</div>
+                        <div class="stat-value num">฿<?php echo hd_nf($summary['total']); ?></div>
                     </div>
                 </div>
             </div>
         </div>
-        <div class="col-12 col-md-6 col-xl-3">
+        <div class="col-12 col-md-4">
             <div class="stat-card bg-body p-3 h-100">
                 <div class="d-flex align-items-center gap-3">
-                    <div class="stat-icon bg-success bg-opacity-10 text-success"><i class="bi bi-arrow-down-circle-fill"></i></div>
+                    <div class="stat-icon bg-primary bg-opacity-10 text-primary"><i class="bi bi-people-fill"></i></div>
                     <div>
-                        <div class="stat-label text-body-secondary">ฝาก / Deposit</div>
-                        <div class="stat-value"><?php echo hd_nf($stats['deposit_count']); ?></div>
-                        <div class="small text-body-secondary num">฿<?php echo hd_nf($stats['deposit_sum']); ?></div>
+                        <div class="stat-label text-body-secondary">จำนวนผู้ฝาก</div>
+                        <div class="stat-value num"><?php echo hd_nf($total); ?></div>
                     </div>
                 </div>
             </div>
         </div>
-        <div class="col-12 col-md-6 col-xl-3">
+        <div class="col-12 col-md-4">
             <div class="stat-card bg-body p-3 h-100">
                 <div class="d-flex align-items-center gap-3">
-                    <div class="stat-icon bg-danger bg-opacity-10 text-danger"><i class="bi bi-arrow-up-circle-fill"></i></div>
+                    <div class="stat-icon bg-warning bg-opacity-10 text-warning"><i class="bi bi-graph-up"></i></div>
                     <div>
-                        <div class="stat-label text-body-secondary">ถอน / Withdraw</div>
-                        <div class="stat-value"><?php echo hd_nf($stats['withdraw_count']); ?></div>
-                        <div class="small text-body-secondary num">฿<?php echo hd_nf($stats['withdraw_sum']); ?></div>
-                    </div>
-                </div>
-            </div>
-        </div>
-        <div class="col-12 col-md-6 col-xl-3">
-            <div class="stat-card bg-body p-3 h-100">
-                <div class="d-flex align-items-center gap-3">
-                    <div class="stat-icon bg-warning bg-opacity-10 text-warning"><i class="bi bi-gift-fill"></i></div>
-                    <div>
-                        <div class="stat-label text-body-secondary">โบนัสฝากรวม / Bonus</div>
-                        <div class="stat-value num">฿<?php echo hd_nf($stats['deposit_bonus']); ?></div>
+                        <div class="stat-label text-body-secondary">เฉลี่ยต่อคน</div>
+                        <div class="stat-value num">฿<?php echo hd_nf($avg); ?></div>
                     </div>
                 </div>
             </div>
         </div>
     </div>
 
-    <!-- Filters -->
-    <form method="GET" action="view.php" class="panel p-3 mb-3">
-        <input type="hidden" name="type" value="<?php echo htmlspecialchars($type); ?>">
-        <?php if ($reveal): ?><input type="hidden" name="reveal" value="1"><?php endif; ?>
-        <div class="row g-2 align-items-end">
-            <div class="col-12 col-md-5">
-                <label class="form-label small text-body-secondary mb-1">Username</label>
-                <div class="input-group">
-                    <span class="input-group-text"><i class="bi bi-search"></i></span>
-                    <input type="text" name="username" class="form-control" placeholder="ค้นหาด้วย username"
-                           value="<?php echo htmlspecialchars($username); ?>">
-                </div>
-            </div>
-            <div class="col-8 col-md-4">
-                <label class="form-label small text-body-secondary mb-1">วันที่ (createDate)</label>
-                <input type="date" name="date" class="form-control" value="<?php echo htmlspecialchars($date); ?>">
-            </div>
-            <div class="col-4 col-md-3 d-flex gap-2">
-                <button type="submit" class="btn btn-primary flex-fill"><i class="bi bi-funnel"></i> กรอง</button>
-                <a href="view.php?type=<?php echo htmlspecialchars($type); ?>" class="btn btn-outline-secondary" title="ล้างตัวกรอง"><i class="bi bi-x-lg"></i></a>
-            </div>
-        </div>
-    </form>
-
-    <!-- Tabs + table -->
+    <!-- Leaderboard -->
     <div class="panel">
-        <ul class="nav nav-tabs px-3 pt-2">
-            <?php
-            $tabs = [
-                'register' => ['สมัคร', 'bi-person-plus'],
-                'deposit'  => ['ฝาก', 'bi-arrow-down-circle'],
-                'withdraw' => ['ถอน', 'bi-arrow-up-circle'],
-            ];
-            foreach ($tabs as $t => [$label, $icon]):
-                $count = $stats[$t . '_count'];
-            ?>
-                <li class="nav-item">
-                    <a class="nav-link <?php echo $t === $type ? 'active' : ''; ?>"
-                       href="<?php echo htmlspecialchars(hd_url(['type' => $t, 'page' => '1'])); ?>">
-                        <i class="bi <?php echo $icon; ?>"></i> <?php echo $label; ?>
-                        <span class="badge text-bg-secondary rounded-pill ms-1"><?php echo hd_nf($count); ?></span>
-                    </a>
-                </li>
-            <?php endforeach; ?>
-        </ul>
+        <div class="d-flex align-items-center justify-content-between px-3 pt-3">
+            <h5 class="mb-0"><i class="bi bi-trophy text-warning"></i> อันดับยอดฝาก · <?php echo htmlspecialchars(hd_month_label($month)); ?></h5>
+        </div>
 
         <?php if (empty($rows)): ?>
             <div class="empty-state">
                 <i class="bi bi-inbox"></i>
-                <p class="mt-3 mb-1 fw-medium">ไม่พบข้อมูล</p>
-                <p class="small mb-0">ลองปรับตัวกรองหรือล้างเงื่อนไขการค้นหา</p>
+                <p class="mt-3 mb-1 fw-medium">ไม่มีรายการฝากในเดือนนี้</p>
+                <p class="small mb-0">ลองเลือกเดือนอื่น</p>
             </div>
         <?php else: ?>
-            <div class="table-wrap">
-                <table class="table table-hover table-striped align-middle mb-0">
+            <div class="table-wrap mt-2">
+                <table class="table table-hover align-middle mb-0">
                     <thead>
                         <tr>
-                            <?php foreach (array_keys($rows[0]) as $key): ?>
-                                <th><?php echo htmlspecialchars((string) $key); ?></th>
-                            <?php endforeach; ?>
+                            <th style="width:72px">อันดับ</th>
+                            <th>เบอร์โทร (tel)</th>
+                            <th class="text-end">ยอดฝากรวม</th>
+                            <th class="text-end" style="width:110px">ครั้ง</th>
                         </tr>
                     </thead>
                     <tbody>
-                        <?php foreach ($rows as $row): ?>
-                            <tr>
-                                <?php foreach ($row as $col => $value): ?>
-                                    <td><?php echo hd_cell((string) $col, $value, $reveal); ?></td>
-                                <?php endforeach; ?>
+                        <?php foreach ($rows as $i => $row):
+                            $rank = $offset + $i + 1;
+                            $tel  = (string) ($row['tel'] ?? '');
+                            $telDisplay = $tel === '' ? '—' : ($reveal ? $tel : hd_mask($tel));
+                            $isTop = $rank <= 3;
+                        ?>
+                            <tr class="<?php echo $isTop ? 'top-row' : ''; ?>">
+                                <td>
+                                    <?php if ($isTop): ?>
+                                        <span class="rank-badge rank-<?php echo $rank; ?>"><?php echo $rank; ?></span>
+                                    <?php else: ?>
+                                        <span class="text-body-secondary ps-2"><?php echo $rank; ?></span>
+                                    <?php endif; ?>
+                                </td>
+                                <td class="tel"><?php echo htmlspecialchars($telDisplay); ?></td>
+                                <td class="text-end amount num">฿<?php echo hd_nf((int) $row['total_deposit']); ?></td>
+                                <td class="text-end"><span class="badge rounded-pill text-bg-secondary num"><?php echo hd_nf((int) $row['deposit_count']); ?></span></td>
                             </tr>
                         <?php endforeach; ?>
                     </tbody>
@@ -398,8 +361,8 @@ function hd_nf(int $n): string { return number_format($n); }
             <!-- Pagination -->
             <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 p-3 border-top">
                 <span class="small text-body-secondary">
-                    แสดง <?php echo hd_nf(($page - 1) * HD_PER_PAGE + 1); ?>–<?php echo hd_nf(min($page * HD_PER_PAGE, $total)); ?>
-                    จาก <?php echo hd_nf($total); ?> รายการ
+                    แสดงอันดับ <?php echo hd_nf($offset + 1); ?>–<?php echo hd_nf(min($offset + $per, $total)); ?>
+                    จาก <?php echo hd_nf($total); ?> คน
                 </span>
                 <nav>
                     <ul class="pagination pagination-sm mb-0">
@@ -407,16 +370,16 @@ function hd_nf(int $n): string { return number_format($n); }
                             <a class="page-link" href="<?php echo htmlspecialchars(hd_url(['page' => $page - 1])); ?>"><i class="bi bi-chevron-left"></i></a>
                         </li>
                         <?php
-                        $start = max(1, $page - 2);
-                        $end   = min($totalPages, $page + 2);
-                        if ($start > 1) echo '<li class="page-item"><a class="page-link" href="' . htmlspecialchars(hd_url(['page' => 1])) . '">1</a></li>' . ($start > 2 ? '<li class="page-item disabled"><span class="page-link">…</span></li>' : '');
-                        for ($p = $start; $p <= $end; $p++):
+                        $s = max(1, $page - 2);
+                        $e = min($totalPages, $page + 2);
+                        if ($s > 1) echo '<li class="page-item"><a class="page-link" href="' . htmlspecialchars(hd_url(['page' => 1])) . '">1</a></li>' . ($s > 2 ? '<li class="page-item disabled"><span class="page-link">…</span></li>' : '');
+                        for ($p = $s; $p <= $e; $p++):
                         ?>
                             <li class="page-item <?php echo $p === $page ? 'active' : ''; ?>">
                                 <a class="page-link" href="<?php echo htmlspecialchars(hd_url(['page' => $p])); ?>"><?php echo $p; ?></a>
                             </li>
                         <?php endfor;
-                        if ($end < $totalPages) echo ($end < $totalPages - 1 ? '<li class="page-item disabled"><span class="page-link">…</span></li>' : '') . '<li class="page-item"><a class="page-link" href="' . htmlspecialchars(hd_url(['page' => $totalPages])) . '">' . $totalPages . '</a></li>';
+                        if ($e < $totalPages) echo ($e < $totalPages - 1 ? '<li class="page-item disabled"><span class="page-link">…</span></li>' : '') . '<li class="page-item"><a class="page-link" href="' . htmlspecialchars(hd_url(['page' => $totalPages])) . '">' . $totalPages . '</a></li>';
                         ?>
                         <li class="page-item <?php echo $page >= $totalPages ? 'disabled' : ''; ?>">
                             <a class="page-link" href="<?php echo htmlspecialchars(hd_url(['page' => $page + 1])); ?>"><i class="bi bi-chevron-right"></i></a>
@@ -428,13 +391,12 @@ function hd_nf(int $n): string { return number_format($n); }
     </div>
 
     <p class="text-center text-body-secondary small mt-4 mb-0">
-        <i class="bi bi-shield-lock"></i> ข้อมูลส่วนตัวถูกปิดบังโดยค่าเริ่มต้น · กด"แสดงเต็ม" เพื่อดูค่าจริง
+        <i class="bi bi-shield-lock"></i> เบอร์โทรถูกปิดบังโดยค่าเริ่มต้น · กด "แสดงเบอร์" เพื่อดูเต็ม · ไฟล์ CSV มีเบอร์เต็ม
     </p>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-    // Theme toggle with persistence.
     (function () {
         const html = document.documentElement;
         const btn = document.getElementById('themeToggle');
